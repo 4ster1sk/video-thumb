@@ -52,25 +52,37 @@ MAX_REDIRECTS = int(os.environ.get("MAX_REDIRECTS", "5"))
 _ffmpeg_ok: bool = False
 _ffprobe_ok: bool = False
 
-# ffprobe の `format.format_name` → MIME タイプ。
+# ffprobe の `(format.format_name, has_video)` → MIME タイプ。
 # 複数コンテナを区別しない値 (例: "mov,mp4,m4a,3gp,3g2,mj2") はそのままキーにする。
-_FORMAT_NAME_TO_MIME: dict[str, str] = {
-    "mov,mp4,m4a,3gp,3g2,mj2": "video/mp4",
-    "matroska,webm": "video/webm",
-    "avi": "video/x-msvideo",
-    "flv": "video/x-flv",
-    "mpegts": "video/mp2t",
-    "mpeg": "video/mpeg",
-    "ogg": "video/ogg",
-    "asf": "video/x-ms-asf",
+# has_video=True/False で video/* と audio/* を切り替える。
+_FORMAT_NAME_TO_MIME: dict[tuple[str, bool], str] = {
+    # video stream あり
+    ("mov,mp4,m4a,3gp,3g2,mj2", True): "video/mp4",
+    ("matroska,webm", True): "video/webm",
+    ("avi", True): "video/x-msvideo",
+    ("flv", True): "video/x-flv",
+    ("mpegts", True): "video/mp2t",
+    ("mpeg", True): "video/mpeg",
+    ("ogg", True): "video/ogg",
+    ("asf", True): "video/x-ms-asf",
+    # audio のみ
+    ("mov,mp4,m4a,3gp,3g2,mj2", False): "audio/mp4",
+    ("matroska,webm", False): "audio/webm",
+    ("ogg", False): "audio/ogg",
+    ("mpeg", False): "audio/mpeg",
+    ("asf", False): "audio/x-ms-asf",
+    ("mp3", False): "audio/mpeg",
+    ("wav", False): "audio/wav",
+    ("flac", False): "audio/flac",
+    ("aac", False): "audio/aac",
 }
 
 
-def _format_name_to_mime(format_name: str | None) -> str | None:
-    """ffprobe の format_name から MIME タイプを引く。未マップは None。"""
+def _format_name_to_mime(format_name: str | None, has_video: bool) -> str | None:
+    """ffprobe の format_name + video stream 有無から MIME を引く。未マップは None。"""
     if not format_name:
         return None
-    return _FORMAT_NAME_TO_MIME.get(format_name)
+    return _FORMAT_NAME_TO_MIME.get((format_name, has_video))
 
 
 def _check_ffmpeg() -> bool:
@@ -344,22 +356,30 @@ async def _probe_video(source: str, is_url: bool = False) -> dict:
 
     width = None
     height = None
+    has_video = False
+    has_audio = False
     for stream in data.get("streams", []):
-        if stream.get("codec_type") == "video":
-            width = stream.get("width")
-            height = stream.get("height")
-            if duration is None and "duration" in stream:
-                try:
-                    duration = float(stream["duration"])
-                except (ValueError, TypeError):
-                    pass
-            break
+        codec_type = stream.get("codec_type")
+        if codec_type == "video":
+            if not has_video:
+                width = stream.get("width")
+                height = stream.get("height")
+                if duration is None and "duration" in stream:
+                    try:
+                        duration = float(stream["duration"])
+                    except (ValueError, TypeError):
+                        pass
+            has_video = True
+        elif codec_type == "audio":
+            has_audio = True
 
     return {
         "duration": duration or 0.0,
         "width": width or 0,
         "height": height or 0,
         "format_name": fmt.get("format_name"),
+        "has_video": has_video,
+        "has_audio": has_audio,
     }
 
 
@@ -423,17 +443,21 @@ def _to_webp(png_data: bytes, max_dim: int, quality: int) -> bytes:
 
 async def _process_video(
     source: str, max_dim: int, is_url: bool = False
-) -> tuple[bytes, dict]:
+) -> tuple[bytes | None, dict]:
     """動画ファイル/URL をサムネイル WebP に変換する。
 
-    probe → frame extract → WebP の中核処理を共通化。
+    probe → (video stream あれば frame extract + WebP) → meta を返す。
+    video stream が無ければ webp=None で返し、ハンドラ側で 204 / 400 に振り分ける。
 
     Returns:
-        (webp_bytes, meta dict)
+        (webp_bytes | None, meta dict)
+        meta["has_video"] が False のとき webp_bytes は None。
     """
     meta = await _probe_video(source, is_url=is_url)
-    duration = meta["duration"]
+    if not meta["has_video"]:
+        return None, meta
 
+    duration = meta["duration"]
     if duration <= MIN_SEEK_SEC:
         seek = 0.0
     else:
@@ -451,14 +475,27 @@ def _make_response(webp: bytes, meta: dict) -> Response:
         "X-Video-Width": str(meta["width"]),
         "X-Video-Height": str(meta["height"]),
     }
-    mime = _format_name_to_mime(meta.get("format_name"))
+    mime = _format_name_to_mime(meta.get("format_name"), has_video=True)
     if mime:
-        headers["X-Video-Mimetype"] = mime
+        headers["X-File-Mimetype"] = mime
     return Response(
         content=webp,
         media_type="image/webp",
         headers=headers,
     )
+
+
+def _make_no_content_response(meta: dict) -> Response:
+    """audio-only など video stream が無い入力に対する 204 レスポンス。
+
+    HTTP 仕様上 204 はボディを持たないが、X-File-Mimetype で audio/* を返し
+    呼び出し側が音声として扱えるようにする。
+    """
+    headers: dict[str, str] = {}
+    mime = _format_name_to_mime(meta.get("format_name"), has_video=False)
+    if mime:
+        headers["X-File-Mimetype"] = mime
+    return Response(status_code=204, headers=headers)
 
 
 @app.post("/thumbnail")
@@ -468,12 +505,16 @@ async def create_thumbnail(
 ) -> Response:
     """動画からサムネイル WebP を生成して返す。
 
-    レスポンスヘッダ:
-        Content-Type: image/webp
-        X-Video-Duration: 秒数 (float)
-        X-Video-Width: 幅 (int)
-        X-Video-Height: 高さ (int)
-        X-Video-Mimetype: 入力動画の MIME タイプ (判定可能な場合のみ)
+    レスポンス:
+        200 OK: 動画からサムネイル WebP を返す
+            Content-Type: image/webp
+            X-Video-Duration: 秒数 (float)
+            X-Video-Width: 幅 (int)
+            X-Video-Height: 高さ (int)
+            X-File-Mimetype: 入力ファイルの MIME タイプ (判定可能な場合のみ)
+        204 No Content: 入力が audio-only でサムネイル化対象外
+            X-File-Mimetype: audio/* (判定可能な場合のみ)
+        400 Bad Request: video/audio どちらの stream も無い、または ffprobe で解析不能
     """
     if not _ffmpeg_ok or not _ffprobe_ok:
         raise HTTPException(status_code=503, detail="FFmpeg が利用できません")
@@ -502,6 +543,13 @@ async def create_thumbnail(
             raise HTTPException(status_code=400, detail="空のファイル")
 
         webp, meta = await _process_video(tmp_path, max_dim, is_url=False)
+        if webp is None:
+            if not meta.get("has_audio"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="video/audio stream が見つかりません",
+                )
+            return _make_no_content_response(meta)
         return _make_response(webp, meta)
 
     finally:
@@ -518,6 +566,8 @@ async def create_thumbnail_from_url(req: ThumbnailFromUrlRequest) -> Response:
     HEAD でリダイレクトを 200 OK まで追跡し、各ホップで SSRF 検証と
     Content-Length チェックを行う。確定した URL を ffprobe / ffmpeg に
     直接渡し、HTTP Range シークで必要箇所のみ取得する。
+
+    レスポンスは `/thumbnail` と同じ (200 / 204 / 400)。
     """
     if not _ffmpeg_ok or not _ffprobe_ok:
         raise HTTPException(status_code=503, detail="FFmpeg が利用できません")
@@ -526,6 +576,13 @@ async def create_thumbnail_from_url(req: ThumbnailFromUrlRequest) -> Response:
     final_url = await _resolve_final_url(req.url)
 
     webp, meta = await _process_video(final_url, max_dim, is_url=True)
+    if webp is None:
+        if not meta.get("has_audio"):
+            raise HTTPException(
+                status_code=400,
+                detail="video/audio stream が見つかりません",
+            )
+        return _make_no_content_response(meta)
     return _make_response(webp, meta)
 
 

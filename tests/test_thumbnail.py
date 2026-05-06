@@ -34,15 +34,15 @@ def test_thumbnail_basic(client, sample_mp4_bytes):
     assert max(img.size) <= main.MAX_DIMENSION
 
 
-def test_thumbnail_includes_video_mimetype_header(client, sample_mp4_bytes):
-    """ffprobe で判別された MIME が X-Video-Mimetype に入る。"""
+def test_thumbnail_includes_file_mimetype_header(client, sample_mp4_bytes):
+    """ffprobe で判別された MIME が X-File-Mimetype に入る。"""
     resp = client.post(
         "/thumbnail",
         files={"file": ("v.mp4", sample_mp4_bytes, "video/mp4")},
     )
     assert resp.status_code == 200
     # libx264 で生成した mp4 → format_name は "mov,mp4,m4a,3gp,3g2,mj2"
-    assert resp.headers.get("X-Video-Mimetype") == "video/mp4"
+    assert resp.headers.get("X-File-Mimetype") == "video/mp4"
 
 
 def test_thumbnail_max_dimension_param(client, sample_mp4_bytes):

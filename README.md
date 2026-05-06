@@ -14,14 +14,21 @@
 - `file` (必須): 動画ファイル
 - `max_dimension` (任意): サムネイル最大辺 (px)。環境変数 `MAX_DIMENSION` で上限キャップされる
 
-**レスポンス**: WebP 画像バイナリ
+**レスポンス**:
 
-**レスポンスヘッダ**:
-- `Content-Type: image/webp`
-- `X-Video-Duration`: 動画の長さ (秒)
-- `X-Video-Width`: 動画の幅 (px)
-- `X-Video-Height`: 動画の高さ (px)
-- `X-Video-Mimetype`: 入力動画の MIME タイプ (ffprobe の `format_name` から判定。未マップのフォーマットでは省略)
+- **200 OK**: 動画からサムネイル WebP を生成して返す
+  - レスポンスボディ: WebP 画像バイナリ
+  - ヘッダ:
+    - `Content-Type: image/webp`
+    - `X-Video-Duration`: 動画の長さ (秒)
+    - `X-Video-Width`: 動画の幅 (px)
+    - `X-Video-Height`: 動画の高さ (px)
+    - `X-File-Mimetype`: 入力ファイルの MIME タイプ (ffprobe の `format_name` + video stream 有無から判定。未マップのフォーマットでは省略)
+- **204 No Content**: 入力が audio-only でサムネイル化対象外
+  - ボディ無し
+  - ヘッダ:
+    - `X-File-Mimetype`: `audio/*` (判定可能な場合のみ)
+- **400 Bad Request**: ffprobe で解析不能、または video/audio どちらの stream も無い
 
 ### `POST /thumbnail_from_url`
 
